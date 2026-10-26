@@ -1,0 +1,193 @@
+From 0a386527c7ce9876f08d7d60565a8087d52c1b67 Mon Sep 17 00:00:00 2001
+From: furangelz <mateusz.dubaj@icloud.com>
+Date: Mon, 26 Oct 2026 16:00:39 +0100
+Subject: [PATCH 3/5] ohos: emulate hmdfs/sharefs mounts and accept code-sign
+ ioctls
+
+Port of hmos2sweet's 0004-0007 to 5.4:
+- OHOS_FS_EMU: storage_daemon's hmdfs/sharefs mounts become tmpfs + bind
+  mounts (in ksys_mount; do_mkdirat() in place of sys_mkdirat(), the tmpfs
+  options handed over as a full page)
+- OHOS_FSVERITY_STUB: FS_IOC_ENABLE_VERITY / FS_IOC_ENABLE_CODE_SIGN are no-ops
+  on regular files and FS_IOC_GETFLAGS reports FS_VERITY_FL (this kernel's
+  fs-verity is Android's and cannot take HarmonyOS's code-sign data)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm64/configs/vendor/ohos.config |  5 ++
+ drivers/ohos/Kconfig                  | 14 +++++
+ fs/ioctl.c                            | 25 +++++++++
+ fs/namespace.c                        | 78 +++++++++++++++++++++++++++
+ 4 files changed, 122 insertions(+)
+
+diff --git a/arch/arm64/configs/vendor/ohos.config b/arch/arm64/configs/vendor/ohos.config
+index cac4b021e..746af1c36 100644
+--- a/arch/arm64/configs/vendor/ohos.config
++++ b/arch/arm64/configs/vendor/ohos.config
+@@ -24,3 +24,8 @@ CONFIG_OHOS_BRINGUP_PERMISSIVE=y
+ CONFIG_ANDROID_BINDER_DEVICES="binder,hwbinder,vndbinder"
+ # display HALs (allocator/composer/Mesa) share buffers on /dev/dri/card0
+ CONFIG_OHOS_DRM_AUTH_ALL=y
++# hmdfs/sharefs (storage_daemon StartUser) emulated with tmpfs + binds
++CONFIG_OHOS_FS_EMU=y
++CONFIG_TMPFS=y
++# installd code signing on a kernel without fs-verity
++CONFIG_OHOS_FSVERITY_STUB=y
+diff --git a/drivers/ohos/Kconfig b/drivers/ohos/Kconfig
+index a77aa67e2..cd8c25846 100644
+--- a/drivers/ohos/Kconfig
++++ b/drivers/ohos/Kconfig
+@@ -24,4 +24,18 @@ config OHOS_DRM_AUTH_ALL
+ 	depends on DRM
+ 	default n
+ 
++config OHOS_FS_EMU
++	bool "Emulate hmdfs/sharefs mounts with tmpfs + bind mounts"
++	default n
++	help
++	  HarmonyOS storage_daemon needs the hmdfs and sharefs filesystems to
++	  start a user.  Emulate their local (non-distributed) views.
++
++config OHOS_FSVERITY_STUB
++	bool "Accept fs-verity / code-sign enable ioctls as no-ops"
++	default n
++	help
++	  Lets HarmonyOS installd install HAPs with native libraries on a
++	  kernel without fs-verity.  No integrity is enforced.
++
+ endmenu
+diff --git a/fs/ioctl.c b/fs/ioctl.c
+index 3118da0de..a47e816b9 100644
+--- a/fs/ioctl.c
++++ b/fs/ioctl.c
+@@ -639,6 +639,31 @@ int do_vfs_ioctl(struct file *filp, unsigned int fd, unsigned int cmd,
+ 	int __user *argp = (int __user *)arg;
+ 	struct inode *inode = file_inode(filp);
+ 
++#ifdef CONFIG_OHOS_FSVERITY_STUB
++	/*
++	 * HarmonyOS installd enables fs-verity / code signing on every native
++	 * library it installs and aborts the install when that fails.  This
++	 * kernel's fs-verity is Android's (no code-sign extension, signatures
++	 * checked against the kernel keyring) and it has no code-sign
++	 * enforcement (XPM), so accept FS_IOC_ENABLE_VERITY ('f', 133) and
++	 * FS_IOC_ENABLE_CODE_SIGN ('f', 200) on regular files as a no-op.
++	 */
++	if (_IOC_TYPE(cmd) == 'f' && _IOC_DIR(cmd) == _IOC_WRITE &&
++	    (_IOC_NR(cmd) == 133 || _IOC_NR(cmd) == 200) && S_ISREG(inode->i_mode))
++		return 0;
++	/* ...and report every regular file as verity-enabled (FS_VERITY_FL),
++	 * which is what installd checks after enabling */
++	if (cmd == FS_IOC_GETFLAGS && S_ISREG(inode->i_mode)) {
++		unsigned int flags;
++
++		error = vfs_ioctl(filp, cmd, arg);
++		if (!error && !get_user(flags, (unsigned int __user *)argp))
++			error = put_user(flags | 0x00100000 /* FS_VERITY_FL */,
++					 (unsigned int __user *)argp);
++		return error;
++	}
++#endif
++
+ 	switch (cmd) {
+ 	case FIOCLEX:
+ 		set_close_on_exec(fd, 1);
+diff --git a/fs/namespace.c b/fs/namespace.c
+index 176bccdf6..e75d960d9 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -3472,6 +3472,78 @@ struct dentry *mount_subtree(struct vfsmount *m, const char *name)
+ }
+ EXPORT_SYMBOL(mount_subtree);
+ 
++#ifdef CONFIG_OHOS_FS_EMU
++/*
++ * HarmonyOS storage_daemon mounts "hmdfs" (distributed fs) and "sharefs" on
++ * every user start.  This kernel has neither, so emulate the local-only
++ * behaviour with what exists:
++ *   hmdfs  src -> dst : tmpfs on dst with device_view/local, merge_view and
++ *                       cloud_merge_view, each a bind mount of src
++ *   sharefs src -> dst: bind mount of src
++ */
++static long ohos_fs_emu_mount(const char *dev, const char __user *udir,
++			      const char *type, unsigned long flags)
++{
++	static const char * const views[] = {
++		"device_view/local", "merge_view", "cloud_merge_view",
++	};
++	char *dir, *p;
++	mm_segment_t old_fs;
++	long ret;
++	int i;
++
++	dir = strndup_user(udir, PATH_MAX);
++	if (IS_ERR(dir))
++		return PTR_ERR(dir);
++	p = kmalloc(PATH_MAX, GFP_KERNEL);
++	if (!p) {
++		kfree(dir);
++		return -ENOMEM;
++	}
++
++	old_fs = get_fs();
++	set_fs(KERNEL_DS);
++	if (!strcmp(type, "sharefs")) {
++		ret = do_mount(dev, (const char __user *)dir, NULL, MS_BIND, NULL);
++		goto out;
++	}
++
++	{
++		/* do_mount() treats data as a page: hand it a full one */
++		char *opts = (char *)get_zeroed_page(GFP_KERNEL);
++
++		if (!opts) {
++			ret = -ENOMEM;
++			goto out;
++		}
++		strlcpy(opts, "mode=0711", PAGE_SIZE);
++		ret = do_mount("hmdfs", (const char __user *)dir, "tmpfs",
++			       flags & (MS_NOSUID | MS_NODEV | MS_NOEXEC), opts);
++		free_page((unsigned long)opts);
++	}
++	if (ret)
++		goto out;
++	snprintf(p, PATH_MAX, "%s/device_view", dir);
++	do_mkdirat(AT_FDCWD, (const char __user *)p, 0711);
++	for (i = 0; i < ARRAY_SIZE(views); i++) {
++		snprintf(p, PATH_MAX, "%s/%s", dir, views[i]);
++		do_mkdirat(AT_FDCWD, (const char __user *)p, 0711);
++		ret = do_mount(dev, (const char __user *)p, NULL, MS_BIND, NULL);
++		if (ret) {
++			pr_warn("ohos_fs_emu: bind %s -> %s failed %ld\n", dev, p, ret);
++			break;
++		}
++	}
++out:
++	set_fs(old_fs);
++	if (ret)
++		pr_warn("ohos_fs_emu: %s %s -> %s failed %ld\n", type, dev, dir, ret);
++	kfree(p);
++	kfree(dir);
++	return ret;
++}
++#endif
++
+ int ksys_mount(const char __user *dev_name, const char __user *dir_name,
+ 	       const char __user *type, unsigned long flags, void __user *data)
+ {
+@@ -3495,6 +3567,12 @@ int ksys_mount(const char __user *dev_name, const char __user *dir_name,
+ 	if (IS_ERR(options))
+ 		goto out_data;
+ 
++#ifdef CONFIG_OHOS_FS_EMU
++	if (kernel_type && kernel_dev && !(flags & (MS_REMOUNT | MS_BIND)) &&
++	    (!strcmp(kernel_type, "hmdfs") || !strcmp(kernel_type, "sharefs")))
++		ret = ohos_fs_emu_mount(kernel_dev, dir_name, kernel_type, flags);
++	else
++#endif
+ 	ret = do_mount(kernel_dev, dir_name, kernel_type, flags, options);
+ 
+ 	kfree(options);
+-- 
+2.55.0
+

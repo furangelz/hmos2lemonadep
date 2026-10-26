@@ -1,0 +1,236 @@
+From 9d0711c15fb444e8596a2e5be8aab5b2a7955761 Mon Sep 17 00:00:00 2001
+From: furangelz <mateusz.dubaj@icloud.com>
+Date: Mon, 26 Oct 2026 16:01:25 +0100
+Subject: [PATCH 4/5] ohos: one-way binder sender pid, memcg knobs, reboot
+ handling
+
+Port of hmos2sweet's 0009, 0012, 0015 and 0018 to 5.4:
+- binder: one-way transactions report the sender pid (async_from_pid/tid
+  in struct binder_transaction, which 5.4 keeps in binder_internal.h)
+- reboot: hmos.noreboot=1 refuses any reason containing "panic"; every
+  power off/restart request is logged with its caller; RESTART2 "shutdown"
+  and "poweroff" power the phone off
+- memcg: the HarmonyOS memmgr files (memory.name, app_score, zswapd_*, ...)
+  are accepted and remembered, so memmgrservice starts
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/android/binder.c          |  8 ++-
+ drivers/android/binder_internal.h |  4 ++
+ include/linux/memcontrol.h        |  6 ++
+ kernel/reboot.c                   | 10 +++-
+ mm/memcontrol.c                   | 94 +++++++++++++++++++++++++++++++
+ 5 files changed, 119 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/android/binder.c b/drivers/android/binder.c
+index 79f5a632a..81fa4acb8 100644
+--- a/drivers/android/binder.c
++++ b/drivers/android/binder.c
+@@ -3272,6 +3272,10 @@ static void binder_transaction(struct binder_proc *proc,
+ 		t->from = thread;
+ 	else
+ 		t->from = NULL;
++	if (!reply && (tr->flags & TF_ONE_WAY)) {
++		t->async_from_pid = current->tgid;
++		t->async_from_tid = current->pid;
++	}
+ 	t->sender_euid = task_euid(proc->tsk);
+ #ifdef CONFIG_ACCESS_TOKENID
+ 	t->sender_tokenid = current->token;
+@@ -4971,10 +4975,10 @@ static int binder_thread_read(struct binder_proc *proc,
+ 			binder_inner_proc_unlock(thread->proc);
+ #endif
+ 		} else {
+-			trd->sender_pid = 0;
++			trd->sender_pid = t->async_from_pid;
+ #ifdef CONFIG_BINDER_SENDER_INFO
+ 			binder_inner_proc_lock(thread->proc);
+-			thread->sender_pid_nr = 0;
++			thread->sender_pid_nr = t->async_from_pid;
+ 			binder_inner_proc_unlock(thread->proc);
+ #endif
+ 		}
+diff --git a/drivers/android/binder_internal.h b/drivers/android/binder_internal.h
+index d828e20ad..f0ec2664d 100644
+--- a/drivers/android/binder_internal.h
++++ b/drivers/android/binder_internal.h
+@@ -666,6 +666,10 @@ struct binder_transaction {
+ 	u64 sender_tokenid;
+ 	u64 first_tokenid;
+ #endif
++	/* OpenHarmony: one-way transactions still report the sender pid
++	 * (render_service, samgr... check it for async calls too) */
++	pid_t async_from_pid;
++	pid_t async_from_tid;
+ 	ANDROID_VENDOR_DATA(1);
+ };
+ 
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index a1b04d916..ee541f514 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -205,9 +205,15 @@ struct memcg_cgwb_frn {
+  * statistics based on the statistics developed by Rik Van Riel for clock-pro,
+  * to help the administrator determine what knobs to tune.
+  */
++#define HMOS_MEMCG_NVALS 24
+ struct mem_cgroup {
+ 	struct cgroup_subsys_state css;
+ 
++	/* HarmonyOS memmgr knobs (hyperhold/zswapd memcg files): accepted and
++	 * remembered so that memmgrservice can start, no reclaim behind them */
++	char hmos_name[64];
++	u64 hmos_vals[HMOS_MEMCG_NVALS];
++
+ 	/* Private memcg ID. Used to ID objects that outlive the cgroup */
+ 	struct mem_cgroup_id id;
+ 
+diff --git a/kernel/reboot.c b/kernel/reboot.c
+index a8783dd1b..0a913046a 100644
+--- a/kernel/reboot.c
++++ b/kernel/reboot.c
+@@ -380,6 +380,7 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+ 		panic("cannot halt");
+ 
+ 	case LINUX_REBOOT_CMD_POWER_OFF:
++		pr_emerg("hmos: power off requested by %s[%d]\n", current->comm, task_pid_nr(current));
+ 		kernel_power_off();
+ 		do_exit(0);
+ 		break;
+@@ -393,13 +394,20 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+ 		buffer[sizeof(buffer) - 1] = '\0';
+ 
+ #ifdef CONFIG_OHOS_BRINGUP_NOREBOOT
+-		if (hmos_noreboot && !strcmp(buffer, "panic")) {
++		if (hmos_noreboot && strstr(buffer, "panic")) {
+ 			pr_emerg("hmos: refusing reboot(\"panic\") from %s[%d] (hmos.noreboot=1)\n",
+ 				 current->comm, task_pid_nr(current));
+ 			ret = -EPERM;
+ 			break;
+ 		}
+ #endif
++		pr_emerg("hmos: reboot(\"%s\") requested by %s[%d]\n", buffer, current->comm,
++			 task_pid_nr(current));
++		/* HarmonyOS asks for "shutdown"/"poweroff" through RESTART2 on some paths */
++		if (!strncmp(buffer, "shutdown", 8) || !strncmp(buffer, "poweroff", 8)) {
++			kernel_power_off();
++			do_exit(0);
++		}
+ 		kernel_restart(buffer);
+ 		break;
+ 
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 0f676d2f8..c1be6e717 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -4857,6 +4857,97 @@ static ssize_t memcg_write_event_control(struct kernfs_open_file *of,
+ 	return ret;
+ }
+ 
++/*
++ * HarmonyOS memmgrservice configures the hyperhold/zswapd extensions of the
++ * OpenHarmony kernel through extra memcg files (memory.name,
++ * memory.app_score, memory.zswapd_*, ...). When a write fails its init
++ * fails, it never publishes SA 1909, and every client (SceneBoard on each
++ * window occlusion change) then blocks ~1.2 s waiting for it. Provide the
++ * files: values are stored and read back, nothing acts on them.
++ */
++static int hmos_memcg_name_show(struct seq_file *m, void *v)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(m));
++
++	seq_printf(m, "%s\n", memcg->hmos_name);
++	return 0;
++}
++
++static ssize_t hmos_memcg_name_write(struct kernfs_open_file *of, char *buf,
++				     size_t nbytes, loff_t off)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
++
++	strlcpy(memcg->hmos_name, strstrip(buf), sizeof(memcg->hmos_name));
++	return nbytes;
++}
++
++static int hmos_memcg_val_show(struct seq_file *m, void *v)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(m));
++	unsigned int i = seq_cft(m)->private;
++
++	seq_printf(m, "%llu\n", i < HMOS_MEMCG_NVALS ? memcg->hmos_vals[i] : 0);
++	return 0;
++}
++
++static ssize_t hmos_memcg_val_write(struct kernfs_open_file *of, char *buf,
++				    size_t nbytes, loff_t off)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
++	unsigned int i = of_cft(of)->private;
++	unsigned long long v = 0;
++
++	/* multi-value params ("0 0 50") keep their first number */
++	if (sscanf(strstrip(buf), "%llu", &v) < 1)
++		v = 0;
++	if (i < HMOS_MEMCG_NVALS)
++		memcg->hmos_vals[i] = v;
++	return nbytes;
++}
++
++static int hmos_memcg_info_show(struct seq_file *m, void *v)
++{
++	struct mem_cgroup *memcg = mem_cgroup_from_css(seq_css(m));
++
++	seq_printf(m, "memcg score: %llu\nmemcg ub_mem2zram_ratio: %llu\n"
++		   "memcg ub_zram2ufs_ratio: %llu\nmemcg refault_threshold: %llu\n",
++		   memcg->hmos_vals[0], memcg->hmos_vals[1], memcg->hmos_vals[2],
++		   memcg->hmos_vals[3]);
++	return 0;
++}
++
++#define HMOS_MEMCG_VAL(n, idx) { .name = n, .private = idx, \
++	.seq_show = hmos_memcg_val_show, .write = hmos_memcg_val_write }
++
++static struct cftype hmos_memcg_files[] = {
++	{ .name = "name", .seq_show = hmos_memcg_name_show, .write = hmos_memcg_name_write },
++	HMOS_MEMCG_VAL("app_score", 0),
++	HMOS_MEMCG_VAL("ub_ufs2zram_ratio", 4),
++	HMOS_MEMCG_VAL("force_swapin", 5),
++	HMOS_MEMCG_VAL("force_swapout", 6),
++	HMOS_MEMCG_VAL("force_shrink_all", 7),
++	HMOS_MEMCG_VAL("force_shrink_anon", 8),
++	HMOS_MEMCG_VAL("force_shrink_purgeable_bysize", 9),
++	HMOS_MEMCG_VAL("force_soft_limit_reclaim", 10),
++	HMOS_MEMCG_VAL("gpu_reclaimed", 11),
++	HMOS_MEMCG_VAL("soft_limit_param", 12),
++	HMOS_MEMCG_VAL("swap_full_ratio", 13),
++	HMOS_MEMCG_VAL("zram_wm_ratio", 14),
++	HMOS_MEMCG_VAL("zswapd_memcgs_param", 15),
++	HMOS_MEMCG_VAL("avail_buffers", 16),
++	HMOS_MEMCG_VAL("zswapd_pressure", 17),
++	HMOS_MEMCG_VAL("zswapd_presure_show", 18),
++	HMOS_MEMCG_VAL("psi_health_info", 19),
++	HMOS_MEMCG_VAL("eswap_info", 20),
++	HMOS_MEMCG_VAL("space_info", 21),
++	HMOS_MEMCG_VAL("total_info_per_app", 22),
++	HMOS_MEMCG_VAL("zswapd_max_reclaim_size", 23),
++	{ .name = "zswapd_single_memcg_param", .seq_show = hmos_memcg_info_show,
++	  .write = hmos_memcg_val_write, .private = 1 },
++	{ }	/* terminate */
++};
++
+ static struct cftype mem_cgroup_legacy_files[] = {
+ 	{
+ 		.name = "usage_in_bytes",
+@@ -7048,6 +7139,9 @@ static int __init mem_cgroup_init(void)
+ {
+ 	int cpu, node;
+ 
++	if (!mem_cgroup_disabled())
++		WARN_ON(cgroup_add_legacy_cftypes(&memory_cgrp_subsys, hmos_memcg_files));
++
+ #ifdef CONFIG_MEMCG_KMEM
+ 	/*
+ 	 * Kmem cache creation is mostly done with the slab_mutex held,
+-- 
+2.55.0
+

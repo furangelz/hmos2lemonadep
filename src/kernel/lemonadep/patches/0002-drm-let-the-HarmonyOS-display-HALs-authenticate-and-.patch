@@ -1,0 +1,90 @@
+From e22140d4c36608af91c27b80d7f9a434c38f45b2 Mon Sep 17 00:00:00 2001
+From: furangelz <mateusz.dubaj@icloud.com>
+Date: Mon, 26 Oct 2026 15:59:46 +0100
+Subject: [PATCH 2/5] drm: let the HarmonyOS display HALs authenticate and take
+ master (OHOS_DRM_AUTH_ALL)
+
+Port of hmos2sweet's 0002 and 0003 to 5.4: the allocator host, the composer
+host and render_service are separate non-root processes sharing buffers on
+/dev/dri/card0, so every client counts as authenticated, and SET/DROP_MASTER
+lose DRM_ROOT_ONLY (5.4 has no DRM_UNLOCKED flag any more; a busy master still
+cannot be taken).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm64/configs/vendor/ohos.config |  2 ++
+ drivers/gpu/drm/drm_file.c            |  9 +++++++++
+ drivers/gpu/drm/drm_ioctl.c           | 10 ++++++++++
+ drivers/ohos/Kconfig                  |  5 +++++
+ 4 files changed, 26 insertions(+)
+
+diff --git a/arch/arm64/configs/vendor/ohos.config b/arch/arm64/configs/vendor/ohos.config
+index 7c433ec84..cac4b021e 100644
+--- a/arch/arm64/configs/vendor/ohos.config
++++ b/arch/arm64/configs/vendor/ohos.config
+@@ -22,3 +22,5 @@ CONFIG_OHOS_BRINGUP_PERMISSIVE=y
+ # OHOS init creates /dev/binder from uevents; binderfs would hide the misc devices
+ # CONFIG_ANDROID_BINDERFS is not set
+ CONFIG_ANDROID_BINDER_DEVICES="binder,hwbinder,vndbinder"
++# display HALs (allocator/composer/Mesa) share buffers on /dev/dri/card0
++CONFIG_OHOS_DRM_AUTH_ALL=y
+diff --git a/drivers/gpu/drm/drm_file.c b/drivers/gpu/drm/drm_file.c
+index f3095ffc1..5bab737d9 100644
+--- a/drivers/gpu/drm/drm_file.c
++++ b/drivers/gpu/drm/drm_file.c
+@@ -131,6 +131,15 @@ struct drm_file *drm_file_alloc(struct drm_minor *minor)
+ 
+ 	/* for compatibility root is always authenticated */
+ 	file->authenticated = capable(CAP_SYS_ADMIN);
++#ifdef CONFIG_OHOS_DRM_AUTH_ALL
++	/*
++	 * HarmonyOS: the allocator host, the composer host and render_service
++	 * are separate non-root processes sharing buffers on the primary node
++	 * through PRIME; there is no Android-style authenticator, so treat every
++	 * client as authenticated.  KMS still requires DRM master.
++	 */
++	file->authenticated = 1;
++#endif
+ 
+ 	INIT_LIST_HEAD(&file->lhead);
+ 	INIT_LIST_HEAD(&file->fbs);
+diff --git a/drivers/gpu/drm/drm_ioctl.c b/drivers/gpu/drm/drm_ioctl.c
+index 378891ed6..0d247c1d5 100644
+--- a/drivers/gpu/drm/drm_ioctl.c
++++ b/drivers/gpu/drm/drm_ioctl.c
+@@ -606,8 +606,18 @@ static const struct drm_ioctl_desc drm_ioctls[] = {
+ 	DRM_LEGACY_IOCTL_DEF(DRM_IOCTL_SET_SAREA_CTX, drm_legacy_setsareactx, DRM_AUTH|DRM_MASTER|DRM_ROOT_ONLY),
+ 	DRM_LEGACY_IOCTL_DEF(DRM_IOCTL_GET_SAREA_CTX, drm_legacy_getsareactx, DRM_AUTH),
+ 
++#ifdef CONFIG_OHOS_DRM_AUTH_ALL
++	/*
++	 * HarmonyOS display HALs run as unprivileged uids (composer_host,
++	 * allocator_host, render_service): let them take and drop master.
++	 * Only a free master can be taken (drm_setmaster_ioctl checks it).
++	 */
++	DRM_IOCTL_DEF(DRM_IOCTL_SET_MASTER, drm_setmaster_ioctl, 0),
++	DRM_IOCTL_DEF(DRM_IOCTL_DROP_MASTER, drm_dropmaster_ioctl, 0),
++#else
+ 	DRM_IOCTL_DEF(DRM_IOCTL_SET_MASTER, drm_setmaster_ioctl, DRM_ROOT_ONLY),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_DROP_MASTER, drm_dropmaster_ioctl, DRM_ROOT_ONLY),
++#endif
+ 
+ 	DRM_LEGACY_IOCTL_DEF(DRM_IOCTL_ADD_CTX, drm_legacy_addctx, DRM_AUTH|DRM_ROOT_ONLY),
+ 	DRM_LEGACY_IOCTL_DEF(DRM_IOCTL_RM_CTX, drm_legacy_rmctx, DRM_AUTH|DRM_MASTER|DRM_ROOT_ONLY),
+diff --git a/drivers/ohos/Kconfig b/drivers/ohos/Kconfig
+index 721a15967..a77aa67e2 100644
+--- a/drivers/ohos/Kconfig
++++ b/drivers/ohos/Kconfig
+@@ -19,4 +19,9 @@ config OHOS_BRINGUP_PERMISSIVE
+ 	depends on SECURITY_SELINUX_DEVELOP
+ 	default n
+ 
++config OHOS_DRM_AUTH_ALL
++	bool "Treat every DRM client as authenticated (HarmonyOS display HALs)"
++	depends on DRM
++	default n
++
+ endmenu
+-- 
+2.55.0
+

@@ -1,0 +1,73 @@
+From 2ad6a35df73c0d1fff53ce73efd29cde68eebe5d Mon Sep 17 00:00:00 2001
+From: furangelz <mateusz.dubaj@icloud.com>
+Date: Mon, 26 Oct 2026 16:02:02 +0100
+Subject: [PATCH 5/5] lemonadep: firmware search paths, no panic on slow
+ coprocessor restarts
+
+Counterparts of hmos2sweet's 0008 and 0013 for lahaina:
+- OHOS_FIRMWARE_PATHS: the firmware loader also looks in /vendor/firmware,
+  /vendor/firmware_mnt/image (modem partition) and /vendor/dsp, since the
+  HarmonyOS userspace has no Android firmware helper
+- PANIC_ON_SSR_NOTIF_TIMEOUT off (5.4 has no subsystem_restart.c: the
+  remoteproc SSR notifier timeouts are the place where a slow ADSP/modem
+  restart panicked)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm64/configs/vendor/ohos.config | 5 +++++
+ drivers/base/firmware_loader/main.c   | 9 +++++++++
+ drivers/ohos/Kconfig                  | 7 +++++++
+ 3 files changed, 21 insertions(+)
+
+diff --git a/arch/arm64/configs/vendor/ohos.config b/arch/arm64/configs/vendor/ohos.config
+index 746af1c36..95b2b2d68 100644
+--- a/arch/arm64/configs/vendor/ohos.config
++++ b/arch/arm64/configs/vendor/ohos.config
+@@ -29,3 +29,8 @@ CONFIG_OHOS_FS_EMU=y
+ CONFIG_TMPFS=y
+ # installd code signing on a kernel without fs-verity
+ CONFIG_OHOS_FSVERITY_STUB=y
++# firmware read by the kernel from the vendor mounts (no ueventd helper)
++CONFIG_OHOS_FIRMWARE_PATHS=y
++# a coprocessor (ADSP/modem) that is slow to restart must not take the whole
++# phone down: subsystem notifier timeouts only warn
++# CONFIG_PANIC_ON_SSR_NOTIF_TIMEOUT is not set
+diff --git a/drivers/base/firmware_loader/main.c b/drivers/base/firmware_loader/main.c
+index 50244c3eb..84809fecb 100644
+--- a/drivers/base/firmware_loader/main.c
++++ b/drivers/base/firmware_loader/main.c
+@@ -451,6 +451,15 @@ static const char * const fw_path[] = {
+ 	"/odm/etc/wifi",
+ #endif /* CONFIG_OPLUS_FEATURE_WIFI_BDF2 */
+ 	fw_path_para,
++#ifdef CONFIG_OHOS_FIRMWARE_PATHS
++	/* HarmonyOS on lemonadep: there is no ueventd firmware helper, so the
++	 * kernel reads the images itself: GPU, touch and WLAN files from /vendor,
++	 * subsystem images (adsp, cdsp, slpi, modem, venus...) from the modem
++	 * partition and the DSP partition, mounted by the vendor fstab */
++	"/vendor/firmware",
++	"/vendor/firmware_mnt/image",
++	"/vendor/dsp",
++#endif
+ 	"/lib/firmware/updates/" UTS_RELEASE,
+ 	"/lib/firmware/updates",
+ 	"/lib/firmware/" UTS_RELEASE,
+diff --git a/drivers/ohos/Kconfig b/drivers/ohos/Kconfig
+index cd8c25846..c6f609e18 100644
+--- a/drivers/ohos/Kconfig
++++ b/drivers/ohos/Kconfig
+@@ -38,4 +38,11 @@ config OHOS_FSVERITY_STUB
+ 	  Lets HarmonyOS installd install HAPs with native libraries on a
+ 	  kernel without fs-verity.  No integrity is enforced.
+ 
++config OHOS_FIRMWARE_PATHS
++	bool "Look for firmware in the Qualcomm vendor mount points"
++	default n
++	help
++	  /vendor/firmware, /vendor/firmware_mnt/image (modem partition) and
++	  /vendor/dsp, for a userspace without Android's firmware helper.
++
+ endmenu
+-- 
+2.55.0
+
